@@ -1,0 +1,135 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # 仓库根目录里如果有 .zip 工程包，就解压；多个 zip 时按提交时间从旧到新解压，最新的覆盖旧的
+      - name: Unzip project archive(s) if present
+        shell: bash
+        run: |
+          shopt -s nullglob
+          zips=(./*.zip)
+          if [ ${#zips[@]} -gt 0 ]; then
+            for z in "${zips[@]}"; do
+              echo "$(git log -1 --format=%ct -- "$z" 2>/dev/null) $z"
+            done | sort -n | cut -d' ' -f2- | while IFS= read -r z; do
+              echo "Unzipping $z"
+              unzip -o -q "$z" || echo "unzip warning: $z"
+            done
+          fi
+
+      # 自动找到 settings.gradle.kts 所在目录，并自动修复手机端可能产生的 .trashed-* 资源文件名
+      - name: Locate Gradle project and clean resources
+        shell: bash
+        run: |
+          # 如果同时存在子文件夹 XiaomiLiquidWatermark_Android_Project 和根目录工程，把最新的源码同步过去
+          if [ -d "XiaomiLiquidWatermark_Android_Project/app/src" ] && [ -d "app/src" ]; then
+            cp -rf app/src/* XiaomiLiquidWatermark_Android_Project/app/src/ 2>/dev/null || true
+            cp -rf XiaomiLiquidWatermark_Android_Project/app/src/* app/src/ 2>/dev/null || true
+          fi
+
+          # 自动清理或还原任何 .trashed-* 文件（防止 AAPT2 processDebugResources 因 '.' 开头文件名报错！）
+          find . -name ".trashed-*" | while IFS= read -r tf; do
+            dir=$(dirname "$tf")
+            clean_name=$(basename "$tf" | sed -E 's/^[.]trashed-[0-9]+-//')
+            if [ ! -f "$dir/$clean_name" ]; then
+              mv "$tf" "$dir/$clean_name"
+              echo "Restored trashed resource: $dir/$clean_name"
+            else
+              rm -f "$tf"
+              echo "Removed duplicate trashed resource: $tf"
+            fi
+          done
+
+          settings=$(find . -maxdepth 3 -name settings.gradle.kts -not -path './.git/*' | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+          if [ -z "$settings" ]; then
+            echo "::error::settings.gradle.kts not found in repository"
+            ls -la
+            exit 1
+          fi
+          dir=$(dirname "$settings")
+          echo "PROJECT_DIR=$dir" >> "$GITHUB_ENV"
+          echo "Project dir: $dir"
+          ls -la "$dir/app/src/main/res/drawable-nodpi" || true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+            "$SDKM" "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
+          fi
+
+      - name: Install Gradle 8.7
+        shell: bash
+        run: |
+          curl -fsSL --retry 3 https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/gradle-8.7.zip
+          sudo unzip -q -o /tmp/gradle-8.7.zip -d /opt
+          /opt/gradle-8.7/bin/gradle --version
+
+      - name: Raise Gradle memory limits
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          echo "" >> gradle.properties
+          echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" >> gradle.properties
+          echo "kotlin.daemon.jvmargs=-Xmx3g" >> gradle.properties
+          cat gradle.properties
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          /opt/gradle-8.7/bin/gradle assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Show real errors
+        if: failure()
+        shell: bash
+        run: |
+          [ -f build.log ] || exit 0
+          {
+            echo '### 构建失败的真实原因'
+            echo '```'
+            grep -E '^e: |error:|ERROR:|What went wrong|Execution failed|Could not |Unresolved reference|OutOfMemory|Java heap' build.log | head -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^e: |ERROR:' build.log | head -10 | while IFS= read -r l; do echo "::error::${l}"; done || true
+          echo "======== last 60 lines of build.log ========"
+          tail -60 build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Upload compiled APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlankGlassWatermark-apk
+          path: "**/outputs/apk/debug/*.apk"
+          if-no-files-found: error
